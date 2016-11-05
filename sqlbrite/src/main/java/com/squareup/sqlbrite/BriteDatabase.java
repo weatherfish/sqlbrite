@@ -15,12 +15,13 @@
  */
 package com.squareup.sqlbrite;
 
-import android.annotation.TargetApi;
 import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
+import android.database.sqlite.SQLiteStatement;
 import android.database.sqlite.SQLiteTransactionListener;
+import android.os.Build;
 import android.support.annotation.CheckResult;
 import android.support.annotation.IntDef;
 import android.support.annotation.NonNull;
@@ -35,6 +36,7 @@ import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import rx.Observable;
+import rx.Observable.Transformer;
 import rx.Scheduler;
 import rx.Subscriber;
 import rx.functions.Action0;
@@ -59,6 +61,7 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 public final class BriteDatabase implements Closeable {
   private final SQLiteOpenHelper helper;
   private final SqlBrite.Logger logger;
+  private final Transformer<Query, Query> queryTransformer;
 
   // Package-private to avoid synthetic accessor method for 'transaction' instance.
   final ThreadLocal<SqliteTransaction> transactions = new ThreadLocal<>();
@@ -116,10 +119,12 @@ public final class BriteDatabase implements Closeable {
   // Package-private to avoid synthetic accessor method for 'transaction' instance.
   volatile boolean logging;
 
-  BriteDatabase(SQLiteOpenHelper helper, SqlBrite.Logger logger, Scheduler scheduler) {
+  BriteDatabase(SQLiteOpenHelper helper, SqlBrite.Logger logger, Scheduler scheduler,
+      Transformer<Query, Query> queryTransformer) {
     this.helper = helper;
     this.logger = logger;
     this.scheduler = scheduler;
+    this.queryTransformer = queryTransformer;
   }
 
   /**
@@ -252,7 +257,6 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#beginTransactionNonExclusive()
    */
-  @TargetApi(HONEYCOMB)
   @RequiresApi(HONEYCOMB)
   @CheckResult @NonNull
   public Transaction newNonExclusiveTransaction() {
@@ -356,9 +360,10 @@ public final class BriteDatabase implements Closeable {
         .onBackpressureLatest() // Guard against uncontrollable frequency of upstream emissions.
         .startWith(query) //
         .observeOn(scheduler) //
+        .compose(queryTransformer) // Apply the user's query transformer.
         .onBackpressureLatest() // Guard against uncontrollable frequency of scheduler executions.
         .doOnSubscribe(ensureNotInTransaction);
-    // TODO switch to .extend when non-@Experimental
+    // TODO switch to .to() when non-@Experimental
     return new QueryObservable(new Observable.OnSubscribe<Query>() {
       @Override public void call(Subscriber<? super Query> subscriber) {
         queryObservable.unsafeSubscribe(subscriber);
@@ -494,6 +499,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String)
    */
+  // TODO @WorkerThread
   public void execute(String sql) {
     if (logging) log("EXECUTE\n  sql: %s", sql);
 
@@ -510,6 +516,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String, Object[])
    */
+  // TODO @WorkerThread
   public void execute(String sql, Object... args) {
     if (logging) log("EXECUTE\n  sql: %s\n  args: %s", sql, Arrays.toString(args));
 
@@ -526,10 +533,21 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String)
    */
+  // TODO @WorkerThread
   public void executeAndTrigger(String table, String sql) {
+    executeAndTrigger(Collections.singleton(table), sql);
+  }
+
+  /**
+   * See {@link #executeAndTrigger(String, String)} for usage. This overload allows for triggering multiple tables.
+   *
+   * @see BriteDatabase#executeAndTrigger(String, String)
+   */
+  // TODO @WorkerThread
+  public void executeAndTrigger(Set<String> tables, String sql) {
     execute(sql);
 
-    sendTableTrigger(Collections.singleton(table));
+    sendTableTrigger(tables);
   }
 
   /**
@@ -541,10 +559,86 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String, Object[])
    */
+  // TODO @WorkerThread
   public void executeAndTrigger(String table, String sql, Object... args) {
+    executeAndTrigger(Collections.singleton(table), sql, args);
+  }
+
+  /**
+   * See {@link #executeAndTrigger(String, String, Object...)} for usage. This overload allows for triggering multiple tables.
+   *
+   * @see BriteDatabase#executeAndTrigger(String, String, Object...)
+   */
+  // TODO @WorkerThread
+  public void executeAndTrigger(Set<String> tables, String sql, Object... args) {
     execute(sql, args);
 
-    sendTableTrigger(Collections.singleton(table));
+    sendTableTrigger(tables);
+  }
+
+  /**
+   * Execute {@code statement}, if the the number of rows affected by execution of this SQL
+   * statement is of any importance to the caller - for example, UPDATE / DELETE SQL statements.
+   *
+   * @return the number of rows affected by this SQL statement execution.
+   * @throws android.database.SQLException If the SQL string is invalid
+   *
+   * @see SQLiteStatement#executeUpdateDelete()
+   */
+  // TODO @WorkerThread
+  @RequiresApi(Build.VERSION_CODES.HONEYCOMB)
+  public int executeUpdateDelete(String table, SQLiteStatement statement) {
+    return executeUpdateDelete(Collections.singleton(table), statement);
+  }
+
+  /**
+   * See {@link #executeUpdateDelete(String, SQLiteStatement)} for usage. This overload allows for triggering multiple tables.
+   *
+   * @see BriteDatabase#executeUpdateDelete(String, SQLiteStatement)
+   */
+  // TODO @WorkerThread
+  @RequiresApi(Build.VERSION_CODES.HONEYCOMB)
+  public int executeUpdateDelete(Set<String> tables, SQLiteStatement statement) {
+    if (logging) log("EXECUTE\n %s", statement);
+
+    int rows = statement.executeUpdateDelete();
+    if (rows > 0) {
+      // Only send a table trigger if rows were affected.
+      sendTableTrigger(tables);
+    }
+    return rows;
+  }
+
+  /**
+   * Execute {@code statement} and return the ID of the row inserted due to this call.
+   * The SQL statement should be an INSERT for this to be a useful call.
+   *
+   * @return the row ID of the last row inserted, if this insert is successful. -1 otherwise.
+   *
+   * @throws android.database.SQLException If the SQL string is invalid
+   *
+   * @see SQLiteStatement#executeInsert()
+   */
+  // TODO @WorkerThread
+  public long executeInsert(String table, SQLiteStatement statement) {
+    return executeInsert(Collections.singleton(table), statement);
+  }
+
+  /**
+   * See {@link #executeInsert(String, SQLiteStatement)} for usage. This overload allows for triggering multiple tables.
+   *
+   * @see BriteDatabase#executeInsert(String, SQLiteStatement)
+   */
+  // TODO @WorkerThread
+  public long executeInsert(Set<String> tables, SQLiteStatement statement) {
+    if (logging) log("EXECUTE\n %s", statement);
+
+    long rowId = statement.executeInsert();
+    if (rowId != -1) {
+      // Only send a table trigger if the insert was successful.
+      sendTableTrigger(tables);
+    }
+    return rowId;
   }
 
   /** An in-progress database transaction. */
@@ -619,7 +713,7 @@ public final class BriteDatabase implements Closeable {
   public @interface ConflictAlgorithm {
   }
 
-  private static String indentSql(String sql) {
+  static String indentSql(String sql) {
     return sql.replace("\n", "\n       ");
   }
 
