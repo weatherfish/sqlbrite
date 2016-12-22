@@ -12,7 +12,7 @@ Usage
 Create a `SqlBrite` instance which is an adapter for the library functionality.
 
 ```java
-SqlBrite sqlBrite = SqlBrite.create();
+SqlBrite sqlBrite = new SqlBrite.Builder().build();
 ```
 
 Pass a `SQLiteOpenHelper` instance and a `Scheduler` to create a `BriteDatabase`.
@@ -148,7 +148,7 @@ Download
 --------
 
 ```groovy
-compile 'com.squareup.sqlbrite:sqlbrite:0.8.0'
+compile 'com.squareup.sqlbrite:sqlbrite:1.1.1'
 ```
 
 Snapshots of the development version are available in [Sonatype's `snapshots` repository][snap].

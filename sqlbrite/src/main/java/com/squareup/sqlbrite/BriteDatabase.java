@@ -27,6 +27,7 @@ import android.support.annotation.IntDef;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.support.annotation.RequiresApi;
+import android.support.annotation.WorkerThread;
 import com.squareup.sqlbrite.SqlBrite.Query;
 import java.io.Closeable;
 import java.lang.annotation.Retention;
@@ -71,15 +72,15 @@ public final class BriteDatabase implements Closeable {
   private final Transaction transaction = new Transaction() {
     @Override public void markSuccessful() {
       if (logging) log("TXN SUCCESS %s", transactions.get());
-      getWriteableDatabase().setTransactionSuccessful();
+      getWritableDatabase().setTransactionSuccessful();
     }
 
     @Override public boolean yieldIfContendedSafely() {
-      return getWriteableDatabase().yieldIfContendedSafely();
+      return getWritableDatabase().yieldIfContendedSafely();
     }
 
     @Override public boolean yieldIfContendedSafely(long sleepAmount, TimeUnit sleepUnit) {
-      return getWriteableDatabase().yieldIfContendedSafely(sleepUnit.toMillis(sleepAmount));
+      return getWritableDatabase().yieldIfContendedSafely(sleepUnit.toMillis(sleepAmount));
     }
 
     @Override public void end() {
@@ -90,7 +91,7 @@ public final class BriteDatabase implements Closeable {
       SqliteTransaction newTransaction = transaction.parent;
       transactions.set(newTransaction);
       if (logging) log("TXN END %s", transaction);
-      getWriteableDatabase().endTransaction();
+      getWritableDatabase().endTransaction();
       // Send the triggers after ending the transaction in the DB.
       if (transaction.commit) {
         sendTableTrigger(transaction);
@@ -108,11 +109,6 @@ public final class BriteDatabase implements Closeable {
       }
     }
   };
-
-  // Read and write guarded by 'databaseLock'. Lazily initialized. Use methods to access.
-  private volatile SQLiteDatabase readableDatabase;
-  private volatile SQLiteDatabase writeableDatabase;
-  private final Object databaseLock = new Object();
 
   private final Scheduler scheduler;
 
@@ -134,33 +130,59 @@ public final class BriteDatabase implements Closeable {
     logging = enabled;
   }
 
-  SQLiteDatabase getReadableDatabase() {
-    SQLiteDatabase db = readableDatabase;
-    if (db == null) {
-      synchronized (databaseLock) {
-        db = readableDatabase;
-        if (db == null) {
-          if (logging) log("Creating readable database");
-          db = readableDatabase = helper.getReadableDatabase();
-        }
-      }
-    }
-    return db;
+  /**
+   * Create and/or open a database.  This will be the same object returned by
+   * {@link SQLiteOpenHelper#getWritableDatabase} unless some problem, such as a full disk,
+   * requires the database to be opened read-only.  In that case, a read-only
+   * database object will be returned.  If the problem is fixed, a future call
+   * to {@link SQLiteOpenHelper#getWritableDatabase} may succeed, in which case the read-only
+   * database object will be closed and the read/write object will be returned
+   * in the future.
+   *
+   * <p class="caution">Like {@link SQLiteOpenHelper#getWritableDatabase}, this method may
+   * take a long time to return, so you should not call it from the
+   * application main thread, including from
+   * {@link android.content.ContentProvider#onCreate ContentProvider.onCreate()}.
+   *
+   * @throws android.database.sqlite.SQLiteException if the database cannot be opened
+   * @return a database object valid until {@link SQLiteOpenHelper#getWritableDatabase}
+   *     or {@link #close} is called.
+   */
+  @NonNull @CheckResult @WorkerThread
+  public SQLiteDatabase getReadableDatabase() {
+    return helper.getReadableDatabase();
   }
 
-  // Package-private to avoid synthetic accessor method for 'transaction' instance.
-  SQLiteDatabase getWriteableDatabase() {
-    SQLiteDatabase db = writeableDatabase;
-    if (db == null) {
-      synchronized (databaseLock) {
-        db = writeableDatabase;
-        if (db == null) {
-          if (logging) log("Creating writeable database");
-          db = writeableDatabase = helper.getWritableDatabase();
-        }
-      }
-    }
-    return db;
+
+  /** @deprecated Use {@link #getWritableDatabase()}. */
+  @Deprecated
+  @NonNull @CheckResult @WorkerThread
+  public SQLiteDatabase getWriteableDatabase() {
+    return helper.getWritableDatabase();
+  }
+
+  /**
+   * Create and/or open a database that will be used for reading and writing.
+   * The first time this is called, the database will be opened and
+   * {@link SQLiteOpenHelper#onCreate}, {@link SQLiteOpenHelper#onUpgrade}
+   * and/or {@link SQLiteOpenHelper#onOpen} will be called.
+   *
+   * <p>Once opened successfully, the database is cached, so you can
+   * call this method every time you need to write to the database.
+   * (Make sure to call {@link #close} when you no longer need the database.)
+   * Errors such as bad permissions or a full disk may cause this method
+   * to fail, but future attempts may succeed if the problem is fixed.</p>
+   *
+   * <p class="caution">Database upgrade may take a long time, you
+   * should not call this method from the application main thread, including
+   * from {@link android.content.ContentProvider#onCreate ContentProvider.onCreate()}.
+   *
+   * @throws android.database.sqlite.SQLiteException if the database cannot be opened for writing
+   * @return a read/write database object valid until {@link #close} is called
+   */
+  @NonNull @CheckResult @WorkerThread
+  public SQLiteDatabase getWritableDatabase() {
+    return helper.getWritableDatabase();
   }
 
   void sendTableTrigger(Set<String> tables) {
@@ -215,7 +237,7 @@ public final class BriteDatabase implements Closeable {
     SqliteTransaction transaction = new SqliteTransaction(transactions.get());
     transactions.set(transaction);
     if (logging) log("TXN BEGIN %s", transaction);
-    getWriteableDatabase().beginTransactionWithListener(transaction);
+    getWritableDatabase().beginTransactionWithListener(transaction);
 
     return this.transaction;
   }
@@ -263,7 +285,7 @@ public final class BriteDatabase implements Closeable {
     SqliteTransaction transaction = new SqliteTransaction(transactions.get());
     transactions.set(transaction);
     if (logging) log("TXN BEGIN %s", transaction);
-    getWriteableDatabase().beginTransactionWithListenerNonExclusive(transaction);
+    getWritableDatabase().beginTransactionWithListenerNonExclusive(transaction);
 
     return this.transaction;
   }
@@ -274,11 +296,7 @@ public final class BriteDatabase implements Closeable {
    * well as attempting to create new ones for new subscriptions.
    */
   @Override public void close() {
-    synchronized (databaseLock) {
-      readableDatabase = null;
-      writeableDatabase = null;
-      helper.close();
-    }
+    helper.close();
   }
 
   /**
@@ -376,7 +394,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#rawQuery(String, String[])
    */
-  @CheckResult // TODO @WorkerThread
+  @CheckResult @WorkerThread
   public Cursor query(@NonNull String sql, @NonNull String... args) {
     long startNanos = nanoTime();
     Cursor cursor = getReadableDatabase().rawQuery(sql, args);
@@ -394,7 +412,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#insert(String, String, ContentValues)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public long insert(@NonNull String table, @NonNull ContentValues values) {
     return insert(table, values, CONFLICT_NONE);
   }
@@ -404,10 +422,10 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#insertWithOnConflict(String, String, ContentValues, int)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public long insert(@NonNull String table, @NonNull ContentValues values,
       @ConflictAlgorithm int conflictAlgorithm) {
-    SQLiteDatabase db = getWriteableDatabase();
+    SQLiteDatabase db = getWritableDatabase();
 
     if (logging) {
       log("INSERT\n  table: %s\n  values: %s\n  conflictAlgorithm: %s", table, values,
@@ -430,10 +448,10 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#delete(String, String, String[])
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public int delete(@NonNull String table, @Nullable String whereClause,
       @Nullable String... whereArgs) {
-    SQLiteDatabase db = getWriteableDatabase();
+    SQLiteDatabase db = getWritableDatabase();
 
     if (logging) {
       log("DELETE\n  table: %s\n  whereClause: %s\n  whereArgs: %s", table, whereClause,
@@ -456,7 +474,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#update(String, ContentValues, String, String[])
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public int update(@NonNull String table, @NonNull ContentValues values,
       @Nullable String whereClause, @Nullable String... whereArgs) {
     return update(table, values, CONFLICT_NONE, whereClause, whereArgs);
@@ -468,11 +486,11 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#updateWithOnConflict(String, ContentValues, String, String[], int)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public int update(@NonNull String table, @NonNull ContentValues values,
       @ConflictAlgorithm int conflictAlgorithm, @Nullable String whereClause,
       @Nullable String... whereArgs) {
-    SQLiteDatabase db = getWriteableDatabase();
+    SQLiteDatabase db = getWritableDatabase();
 
     if (logging) {
       log("UPDATE\n  table: %s\n  values: %s\n  whereClause: %s\n  whereArgs: %s\n  conflictAlgorithm: %s",
@@ -499,12 +517,11 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public void execute(String sql) {
     if (logging) log("EXECUTE\n  sql: %s", sql);
 
-    SQLiteDatabase db = getWriteableDatabase();
-    db.execSQL(sql);
+    getWritableDatabase().execSQL(sql);
   }
 
   /**
@@ -516,12 +533,11 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String, Object[])
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public void execute(String sql, Object... args) {
     if (logging) log("EXECUTE\n  sql: %s\n  args: %s", sql, Arrays.toString(args));
 
-    SQLiteDatabase db = getWriteableDatabase();
-    db.execSQL(sql, args);
+    getWritableDatabase().execSQL(sql, args);
   }
 
   /**
@@ -533,7 +549,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public void executeAndTrigger(String table, String sql) {
     executeAndTrigger(Collections.singleton(table), sql);
   }
@@ -543,7 +559,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see BriteDatabase#executeAndTrigger(String, String)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public void executeAndTrigger(Set<String> tables, String sql) {
     execute(sql);
 
@@ -559,7 +575,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteDatabase#execSQL(String, Object[])
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public void executeAndTrigger(String table, String sql, Object... args) {
     executeAndTrigger(Collections.singleton(table), sql, args);
   }
@@ -569,7 +585,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see BriteDatabase#executeAndTrigger(String, String, Object...)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public void executeAndTrigger(Set<String> tables, String sql, Object... args) {
     execute(sql, args);
 
@@ -585,7 +601,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteStatement#executeUpdateDelete()
    */
-  // TODO @WorkerThread
+  @WorkerThread
   @RequiresApi(Build.VERSION_CODES.HONEYCOMB)
   public int executeUpdateDelete(String table, SQLiteStatement statement) {
     return executeUpdateDelete(Collections.singleton(table), statement);
@@ -596,7 +612,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see BriteDatabase#executeUpdateDelete(String, SQLiteStatement)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   @RequiresApi(Build.VERSION_CODES.HONEYCOMB)
   public int executeUpdateDelete(Set<String> tables, SQLiteStatement statement) {
     if (logging) log("EXECUTE\n %s", statement);
@@ -619,7 +635,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see SQLiteStatement#executeInsert()
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public long executeInsert(String table, SQLiteStatement statement) {
     return executeInsert(Collections.singleton(table), statement);
   }
@@ -629,7 +645,7 @@ public final class BriteDatabase implements Closeable {
    *
    * @see BriteDatabase#executeInsert(String, SQLiteStatement)
    */
-  // TODO @WorkerThread
+  @WorkerThread
   public long executeInsert(Set<String> tables, SQLiteStatement statement) {
     if (logging) log("EXECUTE\n %s", statement);
 
@@ -649,7 +665,7 @@ public final class BriteDatabase implements Closeable {
      *
      * @see SQLiteDatabase#endTransaction()
      */
-    // TODO @WorkerThread
+    @WorkerThread
     void end();
 
     /**
@@ -660,7 +676,7 @@ public final class BriteDatabase implements Closeable {
      *
      * @see SQLiteDatabase#setTransactionSuccessful()
      */
-    // TODO @WorkerThread
+    @WorkerThread
     void markSuccessful();
 
     /**
@@ -674,7 +690,7 @@ public final class BriteDatabase implements Closeable {
      *
      * @see SQLiteDatabase#yieldIfContendedSafely()
      */
-    // TODO @WorkerThread
+    @WorkerThread
     boolean yieldIfContendedSafely();
 
     /**
@@ -691,13 +707,13 @@ public final class BriteDatabase implements Closeable {
      *
      * @see SQLiteDatabase#yieldIfContendedSafely(long)
      */
-    // TODO @WorkerThread
+    @WorkerThread
     boolean yieldIfContendedSafely(long sleepAmount, TimeUnit sleepUnit);
 
     /**
      * Equivalent to calling {@link #end()}
      */
-    // TODO @WorkerThread
+    @WorkerThread
     @Override void close();
   }
 
